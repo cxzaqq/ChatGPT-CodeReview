@@ -116,7 +116,6 @@ export const robot = (app: Probot) => {
         (file) => {
           const url = new URL(file.contents_url)
           const pathname = decodeURIComponent(url.pathname)
-          // if includePatterns is not empty, only include files that match the pattern
           if (includePatterns.length) {
             return matchPatterns(includePatterns, pathname)
           }
@@ -125,7 +124,6 @@ export const robot = (app: Probot) => {
             return false;
           }
 
-          // if ignorePatterns is not empty, ignore files that match the pattern
           if (ignorePatterns.length) {
             return !matchPatterns(ignorePatterns, pathname)
           }
@@ -139,8 +137,6 @@ export const robot = (app: Probot) => {
       }
 
       console.time('gpt cost');
-
-      const ress = [];
 
       for (let i = 0; i < changedFiles.length; i++) {
         const file = changedFiles[i];
@@ -159,28 +155,34 @@ export const robot = (app: Probot) => {
         try {
           const res = await chat?.codeReview(patch);
           if (!res.lgtm && !!res.review_comment) {
-            ress.push({
-              path: file.filename,
-              body: res.review_comment,
-              position: patch.split('\n').length - 1,
-            })
+            try {
+              // PR 리뷰 코멘트 시도
+              await context.octokit.pulls.createReviewComment({
+                owner: repo.owner,
+                repo: repo.repo,
+                pull_number: context.pullRequest().pull_number,
+                body: res.review_comment,
+                commit_id: commits[commits.length - 1].sha,
+                path: file.filename,
+                position: patch.split('\n').length - 1,
+              });
+            } catch (err: any) {
+              if (err.status === 422) {
+                // 위치 찾기 실패 시 일반 코멘트로 대체
+                await context.octokit.issues.createComment({
+                  owner: repo.owner,
+                  repo: repo.repo,
+                  issue_number: context.pullRequest().pull_number,
+                  body: `🧾 줄을 찾을 수 없어 일반 코멘트로 남깁니다:\n\n${res.review_comment}`,
+                });
+              } else {
+                throw err;
+              }
+            }
           }
         } catch (e) {
           log.info(`review ${file.filename} failed`, e);
         }
-      }
-      try {
-        await context.octokit.pulls.createReview({
-          repo: repo.repo,
-          owner: repo.owner,
-          pull_number: context.pullRequest().pull_number,
-          body: ress.length ? "Code review by ChatGPT" : "LGTM 👍",
-          event: 'COMMENT',
-          commit_id: commits[commits.length - 1].sha,
-          comments: ress,
-        });
-      } catch (e) {
-        log.info(`Failed to create review`, e);
       }
 
       console.timeEnd('gpt cost');
@@ -199,7 +201,6 @@ const matchPatterns = (patterns: string[], path: string) => {
     try {
       return minimatch(path, pattern.startsWith('/') ? "**" + pattern : pattern.startsWith("**") ? pattern : "**/" + pattern);
     } catch {
-      // if the pattern is not a valid glob pattern, try to match it as a regular expression
       try {
         return new RegExp(pattern).test(path);
       } catch (e) {
